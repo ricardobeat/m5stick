@@ -1,0 +1,20 @@
+default:
+    just --list
+
+install-libs:
+    arduino-cli core install esp32:esp32
+    arduino-cli lib install M5GFX
+    arduino-cli lib install M5Unified
+    arduino-cli lib install M5StickCPlus2
+    arduino-cli lib install ESP8266Audio
+
+build:
+    arduino-cli compile --fqbn esp32:esp32:m5stack_stickc_plus2
+
+upload:
+    arduino-cli upload --fqbn esp32:esp32:m5stack_stickc_plus2 --port /dev/cu.usbserial-*
+
+doit: build upload
+
+monitor:
+    arduino-cli monitor --port /dev/cu.usbserial-* --config baudrate=115200
