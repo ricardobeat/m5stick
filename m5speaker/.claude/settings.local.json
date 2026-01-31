@@ -6,7 +6,9 @@
       "Bash(arduino-cli lib show:*)",
       "Bash(arduino-cli lib examples:*)",
       "Bash(arduino-cli core:*)",
-      "Bash(arduino-cli board:*)"
+      "Bash(arduino-cli board:*)",
+      "mcp__acp__Edit",
+      "WebFetch(domain:github.com)"
     ]
   }
 }

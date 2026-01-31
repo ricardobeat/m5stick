@@ -1,5 +1,5 @@
 /**
- * Web Radio Player for M5StickCPlus2 with SPK HAT
+ * Web Radio Player for M5StickCPlus2 with SPK2 HAT
  *
  * Features:
  * - Stream MP3 internet radio stations
@@ -11,8 +11,8 @@
  */
 
 // Set your WiFi credentials here
-#define WIFI_SSID "Lokaal22"
-#define WIFI_PASS "worlddominationviarats"
+#define WIFI_SSID "De Giraf"
+#define WIFI_PASS "agrestic"
 
 #include <WiFi.h>
 #include <esp_system.h>
@@ -85,7 +85,7 @@ public:
 protected:
   m5::Speaker_Class* _m5sound;
   uint8_t _virtual_ch;
-  static constexpr size_t tri_buf_size = 640;
+  static constexpr size_t tri_buf_size = 1536;  // Official M5Unified example size
   int16_t _tri_buffer[3][tri_buf_size];
   size_t _tri_buffer_index = 0;
   size_t _tri_index = 0;
@@ -172,7 +172,7 @@ public:
 };
 
 // Global variables
-static constexpr const int preallocateBufferSize = 5 * 1024;
+static constexpr const int preallocateBufferSize = 16 * 1024;  // Increased for better buffering
 static constexpr const int preallocateCodecSize = 29192;
 static void* preallocateBuffer = nullptr;
 static void* preallocateCodec = nullptr;
@@ -189,7 +189,7 @@ static volatile size_t playindex = ~0u;
 static bool title_updated = false;
 
 // FFT visualization data
-static constexpr size_t WAVE_SIZE = 320;
+static constexpr size_t WAVE_SIZE = 768;  // Match tri_buf_size / 2
 static uint16_t prev_y[(FFT_SIZE / 2) + 1];
 static uint16_t peak_y[(FFT_SIZE / 2) + 1];
 static int16_t raw_data[WAVE_SIZE * 2];
@@ -235,14 +235,8 @@ static void play(size_t index) {
 // Decode task running on separate core
 static void decodeTask(void*) {
   Serial.println("[DecodeTask] Started on core " + String(xPortGetCoreID()));
-  uint32_t loopCount = 0;
 
   for (;;) {
-    // Yield periodically to prevent watchdog timeout
-    if (++loopCount > 100) {
-      loopCount = 0;
-      vTaskDelay(1);
-    }
     if (playindex != ~0u) {
       auto index = playindex;
       playindex = ~0u;
@@ -259,6 +253,14 @@ static void decodeTask(void*) {
       file = new AudioFileSourceICYStream(station_list[index][1]);
       if (!file) {
         Serial.println("[DecodeTask] ERROR: Failed to create ICY stream!");
+        continue;
+      }
+      
+      // Critical: Check if connection was successful
+      if (!file->isOpen()) {
+        Serial.println("[DecodeTask] ERROR: Stream failed to open/connect!");
+        delete file;
+        file = nullptr;
         continue;
       }
 
@@ -287,13 +289,19 @@ static void decodeTask(void*) {
 
     if (decoder && decoder->isRunning()) {
       if (!decoder->loop()) {
-        Serial.println("[DecodeTask] Decoder loop returned false, stopping");
-        decoder->stop();
+        Serial.println("[DecodeTask] Decoder loop returned false");
+        // Check if it's actually an error or just end of stream
+        if (file && !file->isOpen()) {
+          Serial.println("[DecodeTask] Stream connection lost, stopping");
+          stop();
+        } else {
+          decoder->stop();
+        }
       }
-    } else {
-      // Yield when not actively decoding to prevent watchdog
-      vTaskDelay(1);
     }
+    
+    // Small yield to prevent watchdog while keeping stream flowing
+    taskYIELD();
   }
 }
 
@@ -365,7 +373,7 @@ static void gfxLoop(void) {
   // Draw stereo level meter (top bar)
   for (size_t i = 0; i < 2; ++i) {
     int32_t level = 0;
-    for (size_t j = i; j < 640; j += 32) {
+    for (size_t j = i; j < WAVE_SIZE * 2; j += 32) {
       uint32_t lv = abs(raw_data[j]);
       if (level < lv) level = lv;
     }
@@ -431,8 +439,8 @@ static void drawVolumeBar(void) {
 void setup(void) {
   auto cfg = M5.config();
 
-  // Enable SPK HAT
-  cfg.external_speaker.hat_spk = true;
+  // Enable SPK2 HAT
+  cfg.external_speaker.hat_spk2 = true;
 
   M5.begin(cfg);
 
@@ -463,11 +471,14 @@ void setup(void) {
   // Configure speaker
   Serial.println("Configuring speaker...");
   auto spk_cfg = M5.Speaker.config();
-  spk_cfg.sample_rate = 48000;
+  spk_cfg.sample_rate = 96000;  // Higher sample rate per M5Unified example
   spk_cfg.task_pinned_core = APP_CPU_NUM;
+  spk_cfg.task_priority = 2;  // Higher priority for audio playback
+  spk_cfg.dma_buf_count = 8;  // More DMA buffers for smoother playback
+  spk_cfg.dma_buf_len = 128;  // Per ESP8266Audio best practices
   M5.Speaker.config(spk_cfg);
   M5.Speaker.begin();
-  M5.Speaker.setVolume(128);
+  M5.Speaker.setVolume(200);  // SPK2 can handle higher volume levels
   Serial.printf("Speaker configured. Enabled: %d\n", M5.Speaker.isEnabled());
 
   // Setup display
@@ -484,6 +495,11 @@ void setup(void) {
   WiFi.disconnect();
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_STA);
+  
+  // Improve WiFi stability
+  WiFi.setSleep(false);  // Disable WiFi sleep for streaming
+  WiFi.setAutoReconnect(true);
+  
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
   int dots = 0;
@@ -519,18 +535,25 @@ void setup(void) {
 
   // Start decode task on APP CPU (CPU 1) to avoid watchdog issues on CPU 0
   Serial.println("Creating decode task...");
-  xTaskCreatePinnedToCore(decodeTask, "decodeTask", 8192, nullptr, 1, nullptr, APP_CPU_NUM);
+  xTaskCreatePinnedToCore(decodeTask, "decodeTask", 12288, nullptr, 3, nullptr, APP_CPU_NUM);
   Serial.println("Setup complete!");
 }
 
 void loop(void) {
-  // Periodic status log
+  // Periodic status log and WiFi check
   static unsigned long lastLog = 0;
   if (millis() - lastLog > 5000) {
     lastLog = millis();
-    Serial.printf("[Loop] Running. Decoder: %s, Heap: %d\n",
+    Serial.printf("[Loop] Running. Decoder: %s, Heap: %d, WiFi: %s\n",
       (decoder && decoder->isRunning()) ? "playing" : "stopped",
-      ESP.getFreeHeap());
+      ESP.getFreeHeap(),
+      WiFi.isConnected() ? "connected" : "DISCONNECTED");
+    
+    // If WiFi disconnected, try to recover
+    if (!WiFi.isConnected()) {
+      Serial.println("[Loop] WiFi lost, attempting reconnect...");
+      WiFi.reconnect();
+    }
   }
 
   // Update title if changed
@@ -539,19 +562,21 @@ void loop(void) {
     updateHeader();
   }
 
-  // Update FFT visualization
-  gfxLoop();
+  // Update FFT visualization (less frequently to reduce CPU load)
+  static uint8_t skipCount = 0;
+  if (++skipCount >= 2) {
+    skipCount = 0;
+    gfxLoop();
+    drawVolumeBar();
+  }
 
-  // Draw volume bar
-  drawVolumeBar();
-
-  // Frame rate control (~8ms cycle)
+  // Frame rate control (~16ms cycle, reduced from 8ms)
   {
     static int prev_frame;
     int frame;
     do {
       M5.delay(1);
-    } while (prev_frame == (frame = millis() >> 3));
+    } while (prev_frame == (frame = millis() >> 4));
     prev_frame = frame;
   }
 

@@ -1,5 +1,4 @@
-default:
-    just --list
+default: build upload
 
 install-libs:
     arduino-cli core install esp32:esp32
@@ -13,8 +12,6 @@ build:
 
 upload:
     arduino-cli upload --fqbn esp32:esp32:m5stack_stickc_plus2 --port /dev/cu.usbserial-*
-
-doit: build upload
 
 monitor:
     arduino-cli monitor --port /dev/cu.usbserial-* --config baudrate=115200
