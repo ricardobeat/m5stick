@@ -1,0 +1,25 @@
+default: code
+
+libs:
+    arduino-cli lib install "M5GFX"
+    arduino-cli lib install "M5Unified"
+    arduino-cli lib install "M5StickCPlus2"
+
+make-fs:
+    mklittlefs -c ./data -b 4096 -p 256 -s 0x180000 littlefs.bin
+
+upload-fs:
+    esptool --baud 2000000 write-flash 0x670000 littlefs.bin
+
+files: make-fs upload-fs
+
+build:
+    arduino-cli compile --fqbn esp32:esp32:m5stack_stickc_plus2
+
+upload:
+    arduino-cli upload -p /dev/cu.usbserial-* --fqbn esp32:esp32:m5stack_stickc_plus2
+
+code: build upload
+
+# /Users/rtomasi/Library/Arduino15/arduino-cli.yaml
+# https://static-cdn.m5stack.com/resource/arduino/package_m5stack_index.json
