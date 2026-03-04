@@ -1,0 +1,40 @@
+set dotenv-load
+
+default: build upload
+
+libs:
+    arduino-cli lib install "M5GFX"
+    arduino-cli lib install "M5Unified"
+    arduino-cli lib install "M5StickCPlus2"
+    arduino-cli lib install "ArduinoJson"
+    arduino-cli lib install "WebSockets"
+
+build:
+    arduino-cli compile --fqbn esp32:esp32:m5stack_stickc_plus2
+
+upload: build
+    arduino-cli upload --fqbn esp32:esp32:m5stack_stickc_plus2 --port /dev/cu.usbserial-*
+
+monitor:
+    arduino-cli monitor --port /dev/cu.usbserial-* --config baudrate=115200
+
+# Install server dependencies (run once)
+server-setup:
+    uv sync
+    uv run python3 -m piper.download_voices en_US-glados-high
+
+# Start piper TTS server (port 5001)
+piper:
+    uv run python3 -m piper.http_server -m en_US-glados-high --port 5001
+
+# Start pipecat bot server (port 8765)
+bot:
+    uv run python pipecat_bot.py
+
+# Start all servers needed for EVA (kills both if either exits)
+eva:
+    #!/usr/bin/env bash
+    trap 'kill 0' EXIT
+    just piper &
+    just bot &
+    wait

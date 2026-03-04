@@ -1,0 +1,2 @@
+- use the justfile tasks over arduino-cli direct calls whenever possible
+- prefer searching for documentation and examples online instead of looking into local arduino-cli library cache for sources

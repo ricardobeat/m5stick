@@ -1,0 +1,12 @@
+[project]
+name = "eva-servers"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "pipecat-ai[silero,openai,deepgram]",
+    "piper-tts[http]",
+    "aiohttp",
+    "uvicorn",
+    "fastapi>=0.135.1",
+    "torch>=2.10.0",
+]
