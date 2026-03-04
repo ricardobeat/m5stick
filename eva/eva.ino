@@ -10,11 +10,12 @@
 
 #include "secrets.h"
 
-#define WS_HOST "192.168.1.15"
+#define WS_HOST "SuperPotato.local"
 #define WS_PORT  8765
 #define WS_PATH  "/ws"
 
 #include <WiFi.h>
+#include <ESPmDNS.h>
 #include <M5Unified.h>
 #include <WebSocketsClient.h>
 
@@ -224,6 +225,8 @@ void setup() {
     term_print("[WIFI] connecting...");
     while (WiFi.status() != WL_CONNECTED) delay(500);
     term_printf("[WIFI] %s", WiFi.localIP().toString().c_str());
+
+    MDNS.begin("eva");
 
     term_show_prompt("> press A to talk");
 }

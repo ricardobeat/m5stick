@@ -62,7 +62,7 @@ logger = logging.getLogger("eva.bot")
 
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-MODEL = "qwen/qwen3.5-flash-02-23"
+MODEL = "qwen/qwen3-8b"
 PIPER_URL = os.environ.get("PIPER_URL", "http://127.0.0.1:5001")
 MIC_RATE = 16000
 TTS_RATE = 22050
@@ -255,10 +255,10 @@ async def websocket_endpoint(websocket: WebSocket):
         pipeline = Pipeline(
             [
                 transport.input(),
-                PipelineLogger(),
                 stt,
                 context_pair.user(),
                 llm,
+                PipelineLogger(),
                 tts,
                 TTSCompletionProcessor(),
                 transport.output(),
