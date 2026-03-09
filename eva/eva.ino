@@ -2,7 +2,7 @@
  * EVA v3 - Voice Agent on M5StickC Plus2 + SPK2 Hat
  * Transport: WebSocket to pipecat_bot.py (single server, port 8765)
  * Audio out: raw 16kHz PCM streamed in real-time as mic records
- * Audio in:  raw 16kHz PCM (no WAV header) ← server → Speaker.playRaw()
+ * Audio in:  raw 24kHz PCM (no WAV header) ← server → Speaker.playRaw()
  *
  * Flow: press A → connect WS + start mic → stream chunks live →
  *       server VAD detects end of speech → server sends TTS PCM → play
@@ -24,11 +24,11 @@
 // ============================================================
 
 static constexpr int    MIC_RATE     = 16000;
-static constexpr int    TTS_RATE     = 16000;
+static constexpr int    TTS_RATE     = 24000;
 static constexpr size_t MIC_CHUNK    = 1600;   // 100ms at 16kHz
 static constexpr int    MAX_RECORD_S = 15;     // safety cutoff
 
-// PSRAM TTS buffer: 8s at 16kHz 16-bit mono ≈ 256 KB
+// PSRAM TTS buffer: 8s at 24kHz 16-bit mono ≈ 384 KB
 static constexpr size_t TTS_BUF_SIZE = TTS_RATE * 8 * sizeof(int16_t);
 
 // ============================================================

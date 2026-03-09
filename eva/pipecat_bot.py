@@ -8,7 +8,6 @@ Run: uv run python pipecat_bot.py
      (or: just bot)
 """
 
-import audioop
 import logging
 import os
 import sys
@@ -65,8 +64,7 @@ DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 MODEL = "openai/gpt-oss-120b"
 MIC_RATE = 16000
-GROQ_TTS_NATIVE_RATE = 24000  # Groq always outputs 24kHz
-TTS_RATE = 16000               # rate sent to device after downsampling
+TTS_RATE = 24000
 
 if not DEEPGRAM_API_KEY:
     logger.error("DEEPGRAM_API_KEY not set")
@@ -194,38 +192,22 @@ class TTSAudioSender(FrameProcessor):
         self._websocket = websocket
         self._audio_buf = bytearray()
         self._llm_done = False
-        self._tts_started = 0  # total TTS sentences started
-        self._tts_stopped = 0  # total TTS sentences stopped
-
-    async def _flush_and_end(self, direction: FrameDirection):
-        if self._audio_buf:
-            resampled, _ = audioop.ratecv(
-                bytes(self._audio_buf), 2, 1, GROQ_TTS_NATIVE_RATE, TTS_RATE, None
-            )
-            logger.debug("Sending %d bytes of TTS audio (%dHz)", len(resampled), TTS_RATE)
-            await self._websocket.send_bytes(resampled)
-            self._audio_buf.clear()
-        self._llm_done = False
-        await self.push_frame(EndFrame(), direction)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, AudioRawFrame) and not isinstance(frame, InputAudioRawFrame):
             self._audio_buf.extend(frame.audio)
-        elif isinstance(frame, TTSStartedFrame):
-            self._tts_started += 1
         elif isinstance(frame, LLMFullResponseEndFrame):
             self._llm_done = True
-            # Only flush if TTS has fully finished (started ≥ 1 and all stopped)
-            if self._tts_started > 0 and self._tts_stopped == self._tts_started:
-                await self._flush_and_end(direction)
-                return
-        elif isinstance(frame, TTSStoppedFrame):
-            self._tts_stopped += 1
-            if self._llm_done and self._tts_stopped == self._tts_started:
-                await self._flush_and_end(direction)
-                return
+        elif isinstance(frame, TTSStoppedFrame) and self._llm_done:
+            if self._audio_buf:
+                logger.info("Sending %d bytes of TTS audio", len(self._audio_buf))
+                await self._websocket.send_bytes(bytes(self._audio_buf))
+                self._audio_buf.clear()
+            self._llm_done = False
+            await self.push_frame(EndFrame(), direction)
+            return
 
         await self.push_frame(frame, direction)
 
@@ -301,7 +283,7 @@ async def websocket_endpoint(websocket: WebSocket):
     tts = GroqTTSService(
         api_key=GROQ_API_KEY,
         voice_id="autumn",
-        sample_rate=GROQ_TTS_NATIVE_RATE,
+        sample_rate=TTS_RATE,
     )
 
     context = LLMContext([{"role": "system", "content": EVE_SYSTEM}])
