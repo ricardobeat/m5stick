@@ -179,35 +179,29 @@ class TextBroadcastProcessor(FrameProcessor):
 
 
 class TTSAudioSender(FrameProcessor):
-    """Buffer all TTS audio, send as one WebSocket binary message, then end pipeline.
-
-    Pipecat paces audio output at real-time rate, so if we let the transport
-    send audio normally the device can't start playing until the last byte
-    arrives (= full audio duration delay). Instead we intercept all audio
-    frames, buffer them, and fire one big send when TTS is fully done.
+    """Buffer TTS audio per sentence, send as binary WebSocket message on each
+    TTSStoppedFrame. The device accumulates chunks and plays after 200ms of
+    silence. Pipeline stays alive until the client disconnects.
     """
 
     def __init__(self, websocket: WebSocket, **kwargs):
         super().__init__(**kwargs)
         self._websocket = websocket
         self._audio_buf = bytearray()
-        self._llm_done = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, AudioRawFrame) and not isinstance(frame, InputAudioRawFrame):
             self._audio_buf.extend(frame.audio)
-        elif isinstance(frame, LLMFullResponseEndFrame):
-            self._llm_done = True
-        elif isinstance(frame, TTSStoppedFrame) and self._llm_done:
+        elif isinstance(frame, TTSStoppedFrame):
             if self._audio_buf:
                 logger.info("Sending %d bytes of TTS audio", len(self._audio_buf))
-                await self._websocket.send_bytes(bytes(self._audio_buf))
+                try:
+                    await self._websocket.send_bytes(bytes(self._audio_buf))
+                except Exception:
+                    logger.warning("Failed to send TTS audio (client disconnected?)")
                 self._audio_buf.clear()
-            self._llm_done = False
-            await self.push_frame(EndFrame(), direction)
-            return
 
         await self.push_frame(frame, direction)
 
