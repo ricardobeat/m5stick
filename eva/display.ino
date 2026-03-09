@@ -77,6 +77,53 @@ void term_clear_prompt() {
     M5.Display.fillRect(0, TERM_PROMPT_Y, 240, TERM_CHAR_H + 2, TERM_BG);
 }
 
+// Print text word-wrapped across terminal lines (max TERM_CHARS per line).
+void term_print_wrapped(const char* text) {
+    char line[TERM_CHARS + 1];
+    int  line_len = 0;
+    const char* p = text;
+
+    while (*p) {
+        // skip spaces between words
+        while (*p == ' ') p++;
+        if (!*p) break;
+
+        // measure next word
+        const char* word = p;
+        int wlen = 0;
+        while (p[wlen] && p[wlen] != ' ') wlen++;
+
+        // word longer than a full line → hard-break it
+        if (wlen > TERM_CHARS) {
+            if (line_len > 0) { term_print(line); line_len = 0; }
+            strncpy(line, word, TERM_CHARS);
+            line[TERM_CHARS] = '\0';
+            term_print(line);
+            p += wlen;
+            continue;
+        }
+
+        int need = (line_len == 0) ? wlen : (1 + wlen);
+        if (line_len + need > TERM_CHARS) {
+            // flush current line first
+            line[line_len] = '\0';
+            term_print(line);
+            line_len = 0;
+            need = wlen;
+        }
+
+        if (line_len > 0) line[line_len++] = ' ';
+        memcpy(line + line_len, word, wlen);
+        line_len += wlen;
+        p += wlen;
+    }
+
+    if (line_len > 0) {
+        line[line_len] = '\0';
+        term_print(line);
+    }
+}
+
 void term_init() {
     memset(term_buf, 0, sizeof(term_buf));
     term_head = 0;

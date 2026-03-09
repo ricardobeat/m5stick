@@ -13,7 +13,7 @@ import uvicorn
 
 # ── Configure here ──────────────────────────────────────────
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-MODEL              = "qwen/qwen3.5-flash-02-23"  # change here to switch models
+MODEL              = "openai/gpt-oss-120b:nitro"  # change here to switch models
 MAX_TOKENS         = 200
 # ────────────────────────────────────────────────────────────
 

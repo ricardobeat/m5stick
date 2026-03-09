@@ -2,7 +2,7 @@
  * EVA v3 - Voice Agent on M5StickC Plus2 + SPK2 Hat
  * Transport: WebSocket to pipecat_bot.py (single server, port 8765)
  * Audio out: raw 16kHz PCM streamed in real-time as mic records
- * Audio in:  raw 22050Hz PCM (no WAV header) ← server → Speaker.playRaw()
+ * Audio in:  raw 16kHz PCM (no WAV header) ← server → Speaker.playRaw()
  *
  * Flow: press A → connect WS + start mic → stream chunks live →
  *       server VAD detects end of speech → server sends TTS PCM → play
@@ -24,11 +24,11 @@
 // ============================================================
 
 static constexpr int    MIC_RATE     = 16000;
-static constexpr int    TTS_RATE     = 22050;
+static constexpr int    TTS_RATE     = 16000;
 static constexpr size_t MIC_CHUNK    = 1600;   // 100ms at 16kHz
 static constexpr int    MAX_RECORD_S = 15;     // safety cutoff
 
-// PSRAM TTS buffer: 8s at 22050 Hz 16-bit mono ≈ 352 KB
+// PSRAM TTS buffer: 8s at 16kHz 16-bit mono ≈ 256 KB
 static constexpr size_t TTS_BUF_SIZE = TTS_RATE * 8 * sizeof(int16_t);
 
 // ============================================================
@@ -56,15 +56,19 @@ static void app_mem_init() {
 // ============================================================
 
 static WebSocketsClient ws;
-static volatile bool    ws_connected  = false;
-static volatile bool    ws_audio_done = false; // server closed → all TTS received
+static volatile bool          ws_connected   = false;
+static volatile bool          ws_audio_done  = false; // server closed → all TTS received
+static volatile bool          tts_started    = false; // first TTS chunk arrived
+static volatile unsigned long tts_last_ms    = 0;     // millis() of last TTS chunk
 
 static void ws_event(WStype_t type, uint8_t* payload, size_t length) {
     switch (type) {
         case WStype_CONNECTED:
             ws_connected  = true;
             ws_audio_done = false;
+            tts_started   = false;
             tts_bytes     = 0;
+            tts_last_ms   = 0;
             Serial.println("[WS] connected");
             break;
 
@@ -76,14 +80,26 @@ static void ws_event(WStype_t type, uint8_t* payload, size_t length) {
 
         case WStype_BIN:
             if (length > 0 && tts_bytes + length <= TTS_BUF_SIZE) {
+                if (!tts_started) {
+                    tts_started = true;
+                    term_print("[TTS] streaming...");
+                }
                 memcpy(tts_buf + tts_bytes, payload, length);
                 tts_bytes += length;
+                tts_last_ms = millis();
             }
             break;
 
-        case WStype_TEXT:
-            Serial.printf("[WS] text: %.*s\n", (int)length, payload);
+        case WStype_TEXT: {
+            // Null-terminate and display the LLM response text
+            char text[512];
+            size_t len = length < sizeof(text) - 1 ? length : sizeof(text) - 1;
+            memcpy(text, payload, len);
+            text[len] = '\0';
+            Serial.printf("[WS] text: %s\n", text);
+            term_print_wrapped(text);
             break;
+        }
 
         default:
             break;
@@ -133,21 +149,22 @@ static void stream_speak() {
     M5.Speaker.end();
     delay(30);
     M5.Mic.begin();
-    term_print("[MIC] streaming...");
+    term_print("[MIC] recording");
     term_show_prompt("> speak now");
 
-    // --- Stream mic chunks live until server disconnects or max time ---
+    // --- Stream mic until TTS starts arriving or max time ---
     static int16_t chunk[MIC_CHUNK];
     unsigned long deadline = millis() + MAX_RECORD_S * 1000UL;
 
-    while (!ws_audio_done && millis() < deadline) {
+    while (!tts_started && !ws_audio_done && millis() < deadline) {
         ws.loop();
 
-        // Check for cancel (Button A while streaming)
         M5.update();
         if (M5.BtnA.wasPressed()) {
             term_print("[MIC] cancelled");
-            break;
+            M5.Mic.end();
+            ws.disconnect();
+            return;
         }
 
         if (M5.Mic.record(chunk, MIC_CHUNK, MIC_RATE)) {
@@ -156,15 +173,16 @@ static void stream_speak() {
     }
 
     M5.Mic.end();
+    M5.Speaker.begin();
+    M5.Speaker.setVolume(255);
 
-    // --- If server hasn't closed yet, wait for remaining TTS ---
-    if (!ws_audio_done) {
-        term_print("[WS] waiting for TTS...");
-        deadline = millis() + 20000;
-        while (!ws_audio_done && millis() < deadline) {
-            ws.loop();
-            delay(5);
-        }
+    // --- Wait for remaining TTS data ---
+    deadline = millis() + 10000;
+    while (!ws_audio_done && millis() < deadline) {
+        ws.loop();
+        if (tts_last_ms > 0 && millis() - tts_last_ms > 200)
+            ws_audio_done = true;
+        delay(1);
     }
 
     ws.disconnect();
@@ -172,14 +190,14 @@ static void stream_speak() {
 
     if (tts_bytes == 0) {
         term_print("[TTS] no audio");
+        M5.Speaker.end();
         return;
     }
 
-    // --- Play ---
-    term_print("[TTS] speaking...");
-    M5.Speaker.begin();
-    M5.Speaker.setVolume(200);
-    M5.Speaker.playRaw((const int16_t*)tts_buf, tts_bytes / 2, TTS_RATE, false, 1, 0);
+    // --- Single contiguous playback — no inter-chunk gaps ---
+    term_printf("[TTS] playing %uKB", (unsigned)(tts_bytes / 1024));
+    M5.Speaker.playRaw((const int16_t*)tts_buf, tts_bytes / sizeof(int16_t),
+                       TTS_RATE, false, 1, 0);
     while (M5.Speaker.isPlaying()) {
         M5.update();
         delay(10);

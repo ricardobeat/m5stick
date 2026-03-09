@@ -8,11 +8,11 @@ Run: uv run python pipecat_bot.py
      (or: just bot)
 """
 
+import audioop
 import logging
 import os
 import sys
 
-import aiohttp
 import uvicorn
 from fastapi import FastAPI, WebSocket
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -41,9 +41,10 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMUserAggregatorParams,
 )
 from pipecat.serializers.base_serializer import FrameSerializer
+from deepgram import LiveOptions
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai.llm import OpenAILLMService
-from pipecat.services.piper.tts import PiperHttpTTSService
+from pipecat.services.groq.tts import GroqTTSService
 from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketParams,
     FastAPIWebsocketTransport,
@@ -61,17 +62,17 @@ logger = logging.getLogger("eva.bot")
 # ── Config ───────────────────────────────────────────────────────────────────
 
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-MODEL = "qwen/qwen3-8b"
-PIPER_URL = os.environ.get("PIPER_URL", "http://127.0.0.1:5001")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+MODEL = "openai/gpt-oss-120b"
 MIC_RATE = 16000
-TTS_RATE = 22050
+GROQ_TTS_NATIVE_RATE = 24000  # Groq always outputs 24kHz
+TTS_RATE = 16000               # rate sent to device after downsampling
 
 if not DEEPGRAM_API_KEY:
     logger.error("DEEPGRAM_API_KEY not set")
     sys.exit(1)
-if not OPENROUTER_API_KEY:
-    logger.error("OPENROUTER_API_KEY not set")
+if not GROQ_API_KEY:
+    logger.error("GROQ_API_KEY not set")
     sys.exit(1)
 
 # ── EVE system prompt ─────────────────────────────────────────────────────────
@@ -148,18 +149,85 @@ class RawPCMSerializer(FrameSerializer):
         )
 
 
-# ── TTS completion processor ─────────────────────────────────────────────────
+# ── Text broadcast processor ─────────────────────────────────────────────────
 
 
-class TTSCompletionProcessor(FrameProcessor):
-    """Close the pipeline after the LLM response TTS completes."""
+class TextBroadcastProcessor(FrameProcessor):
+    """Sends the full LLM response as a text WebSocket frame when complete."""
+
+    def __init__(self, websocket: WebSocket, **kwargs):
+        super().__init__(**kwargs)
+        self._websocket = websocket
+        self._tokens: list[str] = []
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
+
+        if isinstance(frame, LLMTextFrame):
+            self._tokens.append(frame.text)
+        elif isinstance(frame, LLMFullResponseEndFrame):
+            text = "".join(self._tokens)
+            self._tokens.clear()
+            if text:
+                try:
+                    await self._websocket.send_text(text)
+                except Exception as e:
+                    logger.warning("Failed to send text to client: %s", e)
+
         await self.push_frame(frame, direction)
-        if isinstance(frame, TTSStoppedFrame):
-            logger.debug("TTS stopped — pushing EndFrame to close connection")
-            await self.push_frame(EndFrame(), direction)
+
+
+# ── TTS audio sender ─────────────────────────────────────────────────────────
+
+
+class TTSAudioSender(FrameProcessor):
+    """Buffer all TTS audio, send as one WebSocket binary message, then end pipeline.
+
+    Pipecat paces audio output at real-time rate, so if we let the transport
+    send audio normally the device can't start playing until the last byte
+    arrives (= full audio duration delay). Instead we intercept all audio
+    frames, buffer them, and fire one big send when TTS is fully done.
+    """
+
+    def __init__(self, websocket: WebSocket, **kwargs):
+        super().__init__(**kwargs)
+        self._websocket = websocket
+        self._audio_buf = bytearray()
+        self._llm_done = False
+        self._tts_started = 0  # total TTS sentences started
+        self._tts_stopped = 0  # total TTS sentences stopped
+
+    async def _flush_and_end(self, direction: FrameDirection):
+        if self._audio_buf:
+            resampled, _ = audioop.ratecv(
+                bytes(self._audio_buf), 2, 1, GROQ_TTS_NATIVE_RATE, TTS_RATE, None
+            )
+            logger.debug("Sending %d bytes of TTS audio (%dHz)", len(resampled), TTS_RATE)
+            await self._websocket.send_bytes(resampled)
+            self._audio_buf.clear()
+        self._llm_done = False
+        await self.push_frame(EndFrame(), direction)
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, AudioRawFrame) and not isinstance(frame, InputAudioRawFrame):
+            self._audio_buf.extend(frame.audio)
+        elif isinstance(frame, TTSStartedFrame):
+            self._tts_started += 1
+        elif isinstance(frame, LLMFullResponseEndFrame):
+            self._llm_done = True
+            # Only flush if TTS has fully finished (started ≥ 1 and all stopped)
+            if self._tts_started > 0 and self._tts_stopped == self._tts_started:
+                await self._flush_and_end(direction)
+                return
+        elif isinstance(frame, TTSStoppedFrame):
+            self._tts_stopped += 1
+            if self._llm_done and self._tts_stopped == self._tts_started:
+                await self._flush_and_end(direction)
+                return
+
+        await self.push_frame(frame, direction)
 
 
 # ── Pipeline event logger ────────────────────────────────────────────────────
@@ -209,82 +277,82 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("Client connected from %s", websocket.client)
 
-    async with aiohttp.ClientSession() as http_session:
-        transport = FastAPIWebsocketTransport(
-            websocket=websocket,
-            params=FastAPIWebsocketParams(
-                audio_in_enabled=True,
-                audio_out_enabled=True,
-                add_wav_header=False,
-                serializer=RawPCMSerializer(),
-            ),
-        )
+    transport = FastAPIWebsocketTransport(
+        websocket=websocket,
+        params=FastAPIWebsocketParams(
+            audio_in_enabled=True,
+            audio_out_enabled=False,  # TTSAudioSender handles audio output directly
+            serializer=RawPCMSerializer(),
+        ),
+    )
 
-        stt = DeepgramSTTService(
-            api_key=DEEPGRAM_API_KEY,
-            sample_rate=MIC_RATE,
-        )
+    stt = DeepgramSTTService(
+        api_key=DEEPGRAM_API_KEY,
+        sample_rate=MIC_RATE,
+        live_options=LiveOptions(interim_results=True, model="nova-3"),
+    )
 
-        llm = OpenAILLMService(
-            api_key=OPENROUTER_API_KEY,
-            base_url="https://openrouter.ai/api/v1",
-            model=MODEL,
-        )
+    llm = OpenAILLMService(
+        api_key=GROQ_API_KEY,
+        base_url="https://api.groq.com/openai/v1",
+        model=MODEL,
+    )
 
-        tts = PiperHttpTTSService(
-            base_url=PIPER_URL,
-            aiohttp_session=http_session,
-            sample_rate=TTS_RATE,
-        )
+    tts = GroqTTSService(
+        api_key=GROQ_API_KEY,
+        voice_id="autumn",
+        sample_rate=GROQ_TTS_NATIVE_RATE,
+    )
 
-        context = LLMContext([{"role": "system", "content": EVE_SYSTEM}])
+    context = LLMContext([{"role": "system", "content": EVE_SYSTEM}])
 
-        context_pair = LLMContextAggregatorPair(
-            context,
-            user_params=LLMUserAggregatorParams(
-                vad_analyzer=SileroVADAnalyzer(
-                    params=VADParams(
-                        confidence=0.7,
-                        start_secs=0.2,
-                        stop_secs=0.8,
-                    )
+    context_pair = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(
+            vad_analyzer=SileroVADAnalyzer(
+                params=VADParams(
+                    confidence=0.7,
+                    start_secs=0.2,
+                    stop_secs=0.4,
                 )
-            ),
-        )
+            )
+        ),
+    )
 
-        pipeline = Pipeline(
-            [
-                transport.input(),
-                stt,
-                context_pair.user(),
-                llm,
-                PipelineLogger(),
-                tts,
-                TTSCompletionProcessor(),
-                transport.output(),
-                context_pair.assistant(),
-            ]
-        )
+    pipeline = Pipeline(
+        [
+            transport.input(),
+            stt,
+            context_pair.user(),
+            llm,
+            TextBroadcastProcessor(websocket),
+            PipelineLogger(),
+            tts,
+            TTSAudioSender(websocket),
+            transport.output(),
+            context_pair.assistant(),
+        ]
+    )
 
-        task = PipelineTask(
-            pipeline,
-            params=PipelineParams(
-                enable_metrics=True,
-                enable_usage_metrics=True,
-            ),
-        )
+    task = PipelineTask(
+        pipeline,
+        params=PipelineParams(
+            enable_metrics=True,
+            enable_usage_metrics=True,
+        ),
+    )
 
-        @transport.event_handler("on_client_connected")
-        async def on_client_connected(transport, client):
-            logger.info("on_client_connected — ready")
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(transport, client):
+        logger.info("on_client_connected — ready")
 
-        @transport.event_handler("on_client_disconnected")
-        async def on_client_disconnected(transport, client):
-            logger.info("Client disconnected — cancelling task")
-            await task.cancel()
+    @transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(transport, client):
+        logger.info("Client disconnected — cancelling task")
+        await task.cancel()
 
-        runner = PipelineRunner(handle_sigint=False)
-        await runner.run(task)
+    runner = PipelineRunner(handle_sigint=False)
+    await runner.run(task)
 
     logger.info("WebSocket session closed")
 
